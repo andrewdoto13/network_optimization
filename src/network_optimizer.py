@@ -77,7 +77,7 @@ optimization algorithm.
         self.pct_serving = (self.distance_matrix[["npi"]].merge(
             (self.distance_matrix.loc[self.distance_matrix.distance <= self.distance_matrix.distance_req].groupby("npi")["member_id"].count() / len(self.members))
             .reset_index()
-            .rename({"member_id":"pct_serving"}, axis=1), on="npi", how="left").fillna(0).drop_duplicates())
+            .rename({"member_id":"pct_serving"}, axis=1), on="npi", how="left").fillna(0).drop_duplicates().reset_index(drop=True))
 
         self.pool = pool.copy().merge(self.pct_serving, on=["npi"], how="left")
 
