@@ -86,9 +86,8 @@ optimization algorithm.
     def adequacy(self, network: pd.DataFrame) -> float:
         """
     Calculate adequacy of a network using the adequacy requirements provided by the user. The returned value is a float that
-    describes the percent of adequacy requirements met, and it can't be greater than 1. This is because it is used as a "weight"
-    for the performance metric during optimization. This is how you incorporate the idea of a move contributing to network adequacy
-    as well as to improving performance. But, because the max is 1, you don't get extra contribution if the network is already adequate.
+    is a slight modification of the adequacy index score. It takes the network and the adequacy requirements and it returns the mean
+    of the product of the percent of members with access and the percent of required providers for all the county/specialty combinations.
 
     :param network: pandas DataFrame with the network for which you want to calculate adequacy 
         """
@@ -132,7 +131,7 @@ optimization algorithm.
     def objective(self, network: pd.DataFrame) -> float:
         """
     Objective function that describes the goal of the optimization. Takes in a pandas DataFrame storing a provider network as input.
-    It is the compass for the algorithm to optimize the network.
+    It is the compass for the algorithm to optimize the network. The default is adequacy, but if the user passes in a function, it will use that instead.
 
     :param network: pandas DataFrame with the network for which you want to calculate performance
         """
