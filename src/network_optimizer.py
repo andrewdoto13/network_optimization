@@ -4,7 +4,7 @@ from typing import Optional, List, Tuple
 from sklearn.metrics.pairwise import haversine_distances
 import random
 import time
-from math import radians
+import math
 
 class NetworkOptimizer:
     """
@@ -44,44 +44,59 @@ optimization algorithm.
         self.total_optimization_rounds = 0
         self.adequacy_detail = np.empty(0)
 
-        # create distance matrix
-        member_coords_radians = self.members.loc[:, ["latitude", "longitude"]].applymap(lambda x: radians(x))
-
+        # create access listing
         if len(self.initial_network) > 0:
-            all_providers_radians = pd.concat([
-                self.initial_network[["latitude", "longitude"]], 
-                self.initial_pool[["latitude", "longitude"]]]).applymap(lambda x: radians(x))
-            
-            all_provider_county_specialties = pd.concat([
-                self.initial_network[["npi", "county", "specialty"]], 
-                self.initial_pool[["npi", "county", "specialty"]]])
+            self.access_listing = self.members.rename(
+                {"latitude":"member_latitude", 
+                "longitude":"member_longitude",
+                "county":"member_county"}, axis=1).merge(pd.concat([self.initial_network, self.initial_pool]).rename(
+                    {"latitude":"provider_latitude",
+                    "longitude":"provider_longitude",
+                    "county":"provider_county"}, axis=1), how="cross")
+
         else:
-            all_providers_radians = self.initial_pool[["latitude", "longitude"]].applymap(lambda x: radians(x))
+            self.access_listing = self.members.rename(
+                {"latitude":"member_latitude", 
+                "longitude":"member_longitude",
+                "county":"member_county"}, axis=1).merge(self.initial_pool.rename(
+                    {"latitude":"provider_latitude",
+                    "longitude":"provider_longitude",
+                    "county":"provider_county"}, axis=1), how="cross")
 
-            all_provider_county_specialties = self.initial_pool[["npi", "county", "specialty"]]
-            
-        all_providers_index = pd.concat([self.initial_network.npi, self.initial_pool.npi])
-            
-        # multiply by Earth radius to get miles
-        self.distance_matrix = (pd.DataFrame(data=(haversine_distances(member_coords_radians, all_providers_radians)  * 3959).round(1),
-                                            index=self.members.member_id,
-                                            columns=all_providers_index)
-                                            .reset_index()
-                                            .melt(id_vars="member_id", 
-                                                  var_name="npi", 
-                                                  value_name="distance")
-                                            .merge(all_provider_county_specialties, on="npi", how="left")
-                                            .merge(self.adequacy_reqs, on=["county", "specialty"], how="left")
-                                            )
+        def haversine(lat1, lon1, lat2, lon2):
+     
+            # distance between latitudes
+            # and longitudes
+            dLat = (lat2 - lat1) * math.pi / 180.0
+            dLon = (lon2 - lon1) * math.pi / 180.0
         
-        self.pct_serving = (self.distance_matrix[["npi"]].merge(
-            (self.distance_matrix.loc[self.distance_matrix.distance <= self.distance_matrix.distance_req].groupby("npi")["member_id"].count() / len(self.members))
+            # convert to radians
+            lat1 = (lat1) * math.pi / 180.0
+            lat2 = (lat2) * math.pi / 180.0
+        
+            # apply formulae
+            a = (pow(math.sin(dLat / 2), 2) +
+                pow(math.sin(dLon / 2), 2) *
+                    math.cos(lat1) * math.cos(lat2))
+            rad = 3959
+            c = 2 * math.asin(math.sqrt(a))
+            return rad * c
+        
+        self.access_listing["distance"] = self.access_listing.apply(lambda row: haversine(row.member_latitude, 
+                                                                                          row.member_longitude, 
+                                                                                          row.provider_latitude, 
+                                                                                          row.provider_longitude), axis=1).round(1)
+
+        self.access_listing = self.access_listing.merge(self.adequacy_reqs, left_on=["member_county", "specialty"], right_on=["county", "specialty"], how="left")
+        
+        self.pct_serving = (self.access_listing[["location_id"]].merge(
+            (self.access_listing.loc[self.access_listing.distance <= self.access_listing.distance_req].groupby("location_id")["member_id"].count() / len(self.members))
             .reset_index()
-            .rename({"member_id":"pct_serving"}, axis=1), on="npi", how="left").fillna(0).drop_duplicates().reset_index(drop=True))
+            .rename({"member_id":"pct_serving"}, axis=1), on="location_id", how="left").fillna(0).drop_duplicates().reset_index(drop=True))
 
-        self.pool = pool.copy().merge(self.pct_serving, on=["npi"], how="left")
+        self.pool = pool.copy().merge(self.pct_serving, on=["location_id"], how="left")
 
-        self.best_network = network.copy().merge(self.pct_serving, on=["npi"], how="left") if network is not None else pd.DataFrame(columns=self.pool.columns)
+        self.best_network = network.copy().merge(self.pct_serving, on=["location_id"], how="left") if network is not None else pd.DataFrame(columns=self.pool.columns)
 
     def adequacy(self, network: pd.DataFrame) -> float:
         """
@@ -94,39 +109,48 @@ optimization algorithm.
         if len(network) == 0:
             return 0
         else:
-            network_distances = (self.distance_matrix[["member_id", "npi", "distance"]]
-                     .merge(network[["npi", "specialty", "county"]], on="npi", how="inner")
+            network_distances = (self.access_listing[["member_id", "npi", "location_id", "distance", "provider_count"]]
+                     .merge(network[["npi", "location_id", "specialty", "county"]], on=["npi", "location_id"], how="inner")
                      .merge(self.adequacy_reqs[["county", "specialty", "distance_req"]], on=["county", "specialty"], how="left"))
 
             network_distances["meets_distance"] = network_distances.distance <= network_distances.distance_req
 
-            access_summary = self.adequacy_reqs.merge(
-                network_distances
-                .loc[network_distances.meets_distance == True]
-                .groupby(["county", "specialty"])["member_id"].nunique()
-                .reset_index()
-                .rename({"member_id":"members_with_access"}, axis=1), on=["county", "specialty"], how="left"
-            )
+            access_detail = (network_distances
+                         .loc[network_distances.meets_distance == True]
+                         .groupby(["member_id", "county", "specialty", "provider_count"])[["npi"]]
+                         .count()
+                         .reset_index()
+                         .rename({"npi":"servicing_provider_count"}, axis=1))
             
-            access_summary["pct_members_with_access"] = access_summary.members_with_access / len(self.members)
-
-            provider_counts = network_distances.groupby(["county", "specialty"])["npi"].nunique().reset_index().rename({"npi":"provider_count"}, axis=1)
-
-            adequacy_detail = access_summary.merge(provider_counts, on=["county", "specialty"], how="left").fillna(0)
-
-            adequacy_detail["pct_req_providers"] = adequacy_detail.provider_count / adequacy_detail.min_providers
+            member_access_summary = (access_detail
+                         .loc[access_detail.servicing_provider_count >= access_detail.provider_count]
+                         .groupby(["county", "specialty"])[["member_id"]]
+                         .nunique()
+                         .reset_index()
+                         .rename({"member_id":"members_with_access"}, axis=1))
             
+            servicing_provider_summary = (network_distances
+                              .groupby(["county", "specialty"])[["npi"]]
+                              .nunique()
+                              .reset_index()
+                              .rename({"npi":"servicing_providers"}, axis=1))
+            
+            adequacy_detail = (self.adequacy_reqs.merge(self.members
+                                .groupby("county")[["member_id"]]
+                                .count()
+                                .reset_index()
+                                .rename({"member_id":"total_members"}, axis=1), how="left", on="county")
+                               .merge(member_access_summary, how="left", on=["county", "specialty"])
+                               .merge(servicing_provider_summary, how="left", on=["county", "specialty"])
+                               .fillna(0))
+            
+            adequacy_detail["pct_with_access"] = adequacy_detail.members_with_access / adequacy_detail.total_members
+
+            adequacy_detail["adequacy_index"] = adequacy_detail.pct_with_access * (adequacy_detail.servicing_providers / adequacy_detail.min_providers).apply(lambda x: min(1, x))
+
             self.adequacy_detail = adequacy_detail
-
-            mean_adequacy_score = round((adequacy_detail.pct_members_with_access.apply(lambda x: min(x,1)) * adequacy_detail.pct_req_providers.apply(lambda x: min(x,1))).mean(), 3)
-
-            adequacy_county_specialties = len(adequacy_detail.loc[(adequacy_detail.pct_members_with_access * 100 >= adequacy_detail.min_access_pct)
-                                                                  & (adequacy_detail.provider_count >= adequacy_detail.min_providers)])
-
-            if adequacy_county_specialties == len(adequacy_detail):
-                return 1
-            else:
-                return mean_adequacy_score
+            
+            return adequacy_detail.adequacy_index.mean()
         
     def objective(self, network: pd.DataFrame) -> float:
         """
@@ -148,19 +172,8 @@ optimization algorithm.
     :param pool: pandas DataFrame with the pool of potential providers
         """
         # get additions
-        additions = [("addition", idx) for idx in pool.sort_values(by="pct_serving", ascending=False).index.to_list()]
-        if len(network) == 0:
-            removals = [(None, None) for i in range(len(additions))]
-            swaps = [(None, None, None) for i in range(len(additions))]
-            return list(zip(additions, removals, swaps))
-        else:
-            # get replacement combinations within specialty
-            swapDF = network.reset_index().merge(pool.reset_index(), on = ["county", "specialty"], how = "inner", suffixes= ["_network", "_pool"]).dropna()
-            swapDF["pct_diff"] = swapDF.pct_serving_pool - swapDF.pct_serving_network
-            swaps = [("swap",i,j) for i,j in swapDF.sort_values(by="pct_diff", ascending=False)[["index_network", "index_pool"]].values]
-            # get removals
-            removals =  [("removal", idx) for idx in network.sort_values(by="pct_serving", ascending=True).index.astype(int).to_list()]
-            return list(zip(additions, removals, swaps))
+        additions = [("addition", group) for group in pool.group_id.drop_duplicates().to_list()]
+        return additions
     
     def create_state(self, network: pd.DataFrame, pool: pd.DataFrame, change: Tuple):
         """
@@ -178,13 +191,7 @@ optimization algorithm.
         new_network = network.copy()
 
         if change[0] == "addition":
-            new_network.loc[len(new_network)] = pool.loc[change[1]]
-            return new_network
-        elif change[0] == "removal":
-            new_network = new_network.drop(change[1])
-            return new_network
-        else:
-            new_network.loc[change[1]] = pool.loc[change[2]]
+            new_network = pd.concat([new_network, pool.loc[pool.group_id == change[1]]]).reset_index(drop=True)
             return new_network
     
     def optimize(self, num_rounds: int) -> None:
@@ -210,35 +217,22 @@ optimization algorithm.
             if len(state_changes) == 0:
                 print("Pool has been exhaused")
                 break
+
+            new_states = [self.create_state(self.best_network, self.pool, change) for change in state_changes]
+            new_scores = [self.objective(state) for state in new_states]
+            best_score = np.max(new_scores)
+            best_state_idx = np.argmax(new_scores)
+            best_move = state_changes[best_state_idx]
+            best_state = new_states[best_state_idx]
             
-            for options in state_changes:
-                # generate new states for the options and get the scores
-                new_states = [self.create_state(self.best_network, self.pool, option) for option in options if option[0] in ["addition", "removal", "swap"]]
-                new_scores = np.array([self.objective(state) for state in new_states])
-
-                # get the best performing state and score
-                best_score = np.max(new_scores)
-                best_state_idx = np.argmax(new_scores)
-
-                best_move = options[best_state_idx]
-                best_state = new_states[best_state_idx]
-
-                #if the best new move is better than the latest best performance
-                if best_score > self.performance_history[-1]:
-                    # store best performance and move
-                    self.performance_history = np.append(self.performance_history, best_score)
-                    self.move_tracker.append(best_move)
-                    # update the best network
-                    self.best_network = best_state
-                    # if move involves a pool provider
-                    # drop the new provider from pool so that the algo knows not to try that one again
-                    if best_move[0] == "swap":
-                        self.pool.drop(best_move[2], inplace = True)
-                    elif best_move[0] == "addition":
-                        self.pool.drop(best_move[1], inplace = True)
-                    stop = time.perf_counter()
-                    self.time_tracker = np.append(self.time_tracker, stop - start)
-                    break
+            if best_score > self.performance_history[-1]:
+                self.performance_history = np.append(self.performance_history, best_score)
+                self.move_tracker.append(best_move)
+                self.best_network = best_state
+                if best_move[0] == "addition":
+                        change_members = self.pool.loc[self.pool.group_id == best_move[1]].index
+                        self.pool.drop(change_members, inplace = True)
+                
             if len(self.move_tracker) < self.total_optimization_rounds:
                 stop = time.perf_counter()
                 self.time_tracker = np.append(self.time_tracker, stop - start)

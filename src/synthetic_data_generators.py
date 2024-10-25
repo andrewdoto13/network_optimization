@@ -28,7 +28,7 @@ def generate_providers(num_providers, num_locations, num_groups, specialties, co
     return df
 
 def generate_members(size, min_latitude, max_latitude, min_longitude, max_longitude):
-    members = pd.DataFrame({"member_id": ["".join(str(np.random.randint(10)) for i in range(10)) for j in range(size)],
+    members = pd.DataFrame({"member_id": [i for i in range(size)],
                               "county": ["wayne"] * size,
                               "latitude": [np.round(np.random.randint(min_latitude,max_latitude)/1000000, 6) for i in range(size)],
                               "longitude": [np.round(np.random.randint(min_longitude, max_longitude)/1000000, 6) for i in range(size)]
