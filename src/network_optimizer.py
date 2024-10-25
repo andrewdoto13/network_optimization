@@ -243,4 +243,4 @@ optimization algorithm.
             self.time_tracker = np.append(self.time_tracker, stop - start)
 
         print(f"Average seconds per round of optimization: {self.time_tracker.mean().round(1)}")
-        print(f"Adequacy score for best network: {self.adequacy(self.best_network)}\n")
+        print(f"Adequacy score for best network: {round(self.adequacy(self.best_network), 2)}\n")
