@@ -233,7 +233,7 @@ optimization algorithm.
                         change_members = self.pool.loc[self.pool.group_id == best_move[1]].index
                         self.pool.drop(change_members, inplace = True)
                 
-            if len(self.move_tracker) < self.total_optimization_rounds:
+            else:
                 stop = time.perf_counter()
                 self.time_tracker = np.append(self.time_tracker, stop - start)
                 print("No more options for optimization")
@@ -243,4 +243,4 @@ optimization algorithm.
             self.time_tracker = np.append(self.time_tracker, stop - start)
 
         print(f"Average seconds per round of optimization: {self.time_tracker.mean().round(1)}")
-        print(f"Adequacy score for best network: {round(self.adequacy(self.best_network), 2)}\n")
+        print(f"Adequacy Index for best network: {round(self.adequacy(self.best_network), 2)}\n")
