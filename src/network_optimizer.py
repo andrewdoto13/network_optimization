@@ -90,7 +90,7 @@ optimization algorithm.
         self.access_listing = self.access_listing.merge(self.adequacy_reqs, left_on=["member_county", "specialty"], right_on=["county", "specialty"], how="left")
         
         self.pct_serving = (self.access_listing[["location_id"]].merge(
-            (self.access_listing.loc[self.access_listing.distance <= self.access_listing.distance_req].groupby("location_id")["member_id"].count() / len(self.members))
+            (self.access_listing.loc[self.access_listing.distance <= self.access_listing.distance_req].groupby("location_id")["member_id"].nunique() / len(self.members))
             .reset_index()
             .rename({"member_id":"pct_serving"}, axis=1), on="location_id", how="left").fillna(0).drop_duplicates().reset_index(drop=True))
 
