@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 from typing import Optional, List, Tuple
 from sklearn.metrics.pairwise import haversine_distances
-import random
 import time
 import math
 
