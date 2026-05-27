@@ -1,193 +1,268 @@
-"""Two-phase local search optimizer."""
+"""Two-phase local search optimizer.
+
+Phase 1: Greedy additions — add entities one at a time, picking the best scorer.
+Phase 2: Swap refinement — swap one network entity for one outside entity.
+"""
+
+from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 import pandas as pd
 
-from network_optimizer.adequacy import compute_adequacy
-from network_optimizer.config import OptimizerConfig
-from network_optimizer.distance import compute_access
+from .adequacy import score_network
+from .config import OptimizerConfig
 
 
 @dataclass
-class Move:
-    """A single move in the search space."""
-
-    move_type: str  # "add" or "swap"
-    add_group_id: int
-    remove_group_id: Optional[int] = None
-
-
-@dataclass
-class OptimizationResult:
-    """Result of the optimization run."""
-
-    best_network: pd.DataFrame
-    final_score: float
-    initial_score: float
-    performance_history: list[float] = field(default_factory=list)
-    moves: list["Move"] = field(default_factory=list)
-    phase1_rounds: int = 0
-    phase2_rounds: int = 0
-    total_time: float = 0.0
-    adequacy_detail: Optional[pd.DataFrame] = None
+class SearchResult:
+    """Result from the optimization run."""
+    network: pd.DataFrame
+    score: float
+    phases: list[dict] = field(default_factory=list)
+    elapsed: float = 0.0
+    entities_added: list[str] = field(default_factory=list)
+    entities_swapped: list[tuple[str, str]] = field(default_factory=list)
+    network_entities: set[str] = field(default_factory=set)
 
 
 class NetworkOptimizer:
-    """Two-phase local search: greedy additions then swap refinement."""
+    """Two-phase local search for provider network optimization."""
 
     def __init__(
         self,
         pool: pd.DataFrame,
         members: pd.DataFrame,
-        adequacy_reqs: pd.DataFrame,
-        network: Optional[pd.DataFrame] = None,
-        config: Optional[OptimizerConfig] = None,
+        thresholds: dict,
+        initial_network: pd.DataFrame,
+        config: OptimizerConfig | None = None,
     ):
         self.pool = pool
         self.members = members
-        self.adequacy_reqs = adequacy_reqs
-        self.network = network if network is not None else pd.DataFrame(pool.columns)
+        self.thresholds = thresholds
         self.config = config or OptimizerConfig()
 
-    def evaluate(self, network: pd.DataFrame) -> tuple:
-        """Evaluate a network state. Returns (score, detail)."""
-        access_df = compute_access(network, self.members, self.adequacy_reqs)
-        return compute_adequacy(access_df, self.members, self.adequacy_reqs)
+        # Current network state (entity names)
+        self.network = initial_network.copy()
+        self.network_entities = set(self.network["entity"].str.lower().unique())
+        self.outside_entities = set(pool["entity"].str.lower().unique()) - self.network_entities
 
-    def successors_additions(self, network: pd.DataFrame) -> list["Move"]:
-        """Generate addition moves: one per group in the pool not in the network."""
-        pool_groups = set(self.pool["group_id"])
-        network_groups = set(network["group_id"])
-        candidate_groups = pool_groups - network_groups
-        return [Move("add", gid) for gid in candidate_groups]
+        # Pre-compute entity -> provider mapping
+        self.entity_map = {}
+        for entity, group in pool.groupby("entity"):
+            self.entity_map[entity.lower()] = group
 
-    def successors_swaps(self, network: pd.DataFrame) -> list["Move"]:
-        """Generate swap moves: one per (network_group, pool_group) pair."""
-        pool_groups = set(self.pool["group_id"])
-        network_groups = set(network["group_id"])
-        candidate_groups = pool_groups - network_groups
-        return [
-            Move("swap", add_gid, remove_gid)
-            for remove_gid in network_groups
-            for add_gid in candidate_groups
-        ]
+        # Scoring cache
+        self._last_score: float | None = None
+        self._last_network_hash: int | None = None
+        self.phases: list[dict] = []
 
-    def apply_move(self, network: pd.DataFrame, move: Move) -> pd.DataFrame:
-        """Apply a move and return the new network."""
-        new_network = network.copy()
-        if move.move_type == "add":
-            group = self.pool[self.pool["group_id"] == move.add_group_id]
-            new_network = pd.concat([new_network, group], ignore_index=True)
-        elif move.move_type == "swap":
-            new_network = new_network[new_network["group_id"] != move.remove_group_id]
-            group = self.pool[self.pool["group_id"] == move.add_group_id]
-            new_network = pd.concat([new_network, group], ignore_index=True)
-        return new_network
+    def _get_network_df(self) -> pd.DataFrame:
+        """Reconstruct network DataFrame from current entity set."""
+        entities = sorted(self.network_entities)
+        if not entities:
+            return self.pool.iloc[:0].copy()
+        return self.pool[self.pool["entity"].str.lower().isin(entities)].reset_index(drop=True)
 
-    def _phase_additions(self, network: pd.DataFrame, history: list[float], moves: list["Move"]) -> pd.DataFrame:
-        """Phase 1: Greedy additions until convergence."""
-        score, _ = self.evaluate(network)
-        no_improve = 0
+    def _score(self) -> float:
+        """Score current network, with caching."""
+        network_df = self._get_network_df()
+        return score_network(self.pool, self.members, self.thresholds, network_df)
 
-        for round_num in range(1, self.config.max_rounds + 1):
-            successors = self.successors_additions(network)
-            if not successors:
+    def _add_entity(self, entity: str) -> None:
+        """Add an entity to the network."""
+        self.network_entities.add(entity.lower())
+        self.outside_entities.discard(entity.lower())
+
+    def _remove_entity(self, entity: str) -> None:
+        """Remove an entity from the network."""
+        self.network_entities.discard(entity.lower())
+        self.outside_entities.add(entity.lower())
+
+    def _log(self, message: str) -> None:
+        """Log message based on verbosity level."""
+        if self.config.verbosity >= 1:
+            print(message)
+
+    def phase1_additions(self) -> list[str]:
+        """Phase 1: Greedy additions.
+
+        Iteratively add the entity that gives the biggest score improvement.
+        Stops when no entity improves the score or max_rounds is reached.
+        """
+        self._log("\n--- Phase 1: Greedy Additions ---")
+        added = []
+        no_improve_count = 0
+        start_time = time.time()
+        initial_score = self._score()
+        self._log(f"  Initial score: {initial_score:.2f}%")
+
+        for round_num in range(self.config.max_rounds):
+            # Check time budget
+            if self.config.time_budget and (time.time() - start_time) > self.config.time_budget:
+                self._log(f"  Time budget reached ({self.config.time_budget}s)")
                 break
 
-            best_move = None
-            best_score = score
+            best_entity = None
+            best_score = initial_score
+            best_improvement = 0.0
 
-            for move in successors:
-                candidate = self.apply_move(network, move)
-                cand_score, _ = self.evaluate(candidate)
-                if cand_score > best_score:
-                    best_score = cand_score
-                    best_move = move
+            for entity in sorted(self.outside_entities):
+                self._add_entity(entity)
+                score = self._score()
+                improvement = score - initial_score
+                self._remove_entity(entity)
 
-            if best_move is None:
-                no_improve += 1
-                if no_improve >= self.config.patience:
+                if improvement > best_improvement:
+                    best_improvement = improvement
+                    best_score = score
+                    best_entity = entity
+
+            # Check convergence
+            if self.config.convergence_threshold > 0:
+                relative = best_improvement / max(initial_score, 0.001)
+                if relative < self.config.convergence_threshold:
+                    self._log(f"  Converged at round {round_num + 1} (relative improvement {relative:.4f} < {self.config.convergence_threshold})")
+                    break
+
+            if best_entity is None or best_improvement <= 0:
+                no_improve_count += 1
+                self._log(f"  Round {round_num + 1}: No improvement, {no_improve_count}/{self.config.patience} no-improve")
+                if no_improve_count >= self.config.patience:
+                    self._log(f"  Stopping after {no_improve_count} rounds without improvement")
                     break
                 continue
 
-            network = self.apply_move(network, best_move)
-            history.append(best_score)
-            moves.append(best_move)
-            print(f"  Phase 1 Round {round_num}: +group {best_move.add_group_id} -> {best_score:.4f}")
+            # Commit best entity
+            self._add_entity(best_entity)
+            added.append(best_entity)
+            initial_score = best_score
+            no_improve_count = 0
 
-        return network
+            if self.config.verbosity >= 2:
+                self._log(f"  Round {round_num + 1}: Added '{best_entity}' → score {best_score:.2f}% (+{best_improvement:.2f}%)")
 
-    def _phase_swaps(self, network: pd.DataFrame, history: list[float], moves: list["Move"]) -> pd.DataFrame:
-        """Phase 2: Swap refinement until convergence."""
-        score, _ = self.evaluate(network)
+        self._log(f"  Phase 1 complete: {len(added)} entities added, score {initial_score:.2f}%")
 
-        for round_num in range(1, self.config.max_rounds + 1):
-            successors = self.successors_swaps(network)
-            if not successors:
-                break
+        self.phases.append({
+            "phase": 1,
+            "entities_added": len(added),
+            "final_score": initial_score,
+            "elapsed": time.time() - start_time,
+        })
 
-            best_move = None
-            best_score = score
+        return added
 
-            for move in successors:
-                candidate = self.apply_move(network, move)
-                cand_score, _ = self.evaluate(candidate)
-                if cand_score > best_score:
-                    best_score = cand_score
-                    best_move = move
+    def phase2_swaps(self) -> list[tuple[str, str]]:
+        """Phase 2: Swap refinement.
 
-            if best_move is None:
-                break
+        Iteratively swap one network entity for one outside entity.
+        Stops when no swap improves the score or max_rounds is reached.
+        """
+        if not self.config.enable_swaps:
+            self._log("\n--- Phase 2: Swaps disabled ---")
+            return []
 
-            network = self.apply_move(network, best_move)
-            history.append(best_score)
-            moves.append(best_move)
-            print(f"  Phase 2 Round {round_num}: swap {best_move.remove_group_id} -> {best_move.add_group_id} -> {best_score:.4f}")
+        if not self.network_entities or not self.outside_entities:
+            self._log("\n--- Phase 2: Skipped (no entities to swap) ---")
+            return []
 
-        return network
-
-    def optimize(self) -> OptimizationResult:
-        """Run the full two-phase optimization."""
+        self._log("\n--- Phase 2: Swap Refinement ---")
+        swapped = []
+        no_improve_count = 0
         start_time = time.time()
+        initial_score = self._score()
+        self._log(f"  Starting score: {initial_score:.2f}%")
 
-        initial_score, _ = self.evaluate(self.network)
-        print(f"Initial score: {initial_score:.4f}")
-        print(f"Initial network: {len(self.network)} groups")
+        for round_num in range(self.config.max_rounds):
+            # Check time budget
+            if self.config.time_budget and (time.time() - start_time) > self.config.time_budget:
+                self._log(f"  Time budget reached ({self.config.time_budget}s)")
+                break
 
-        history = [initial_score]
-        moves = []
+            best_swap = None
+            best_score = initial_score
+            best_improvement = 0.0
 
-        # Phase 1: Additions
-        print("\nPhase 1: Greedy additions")
-        self.network = self._phase_additions(self.network, history, moves)
-        phase1_rounds = len([m for m in moves if m.move_type == "add"])
+            for in_entity in sorted(self.network_entities):
+                for out_entity in sorted(self.outside_entities):
+                    # Try swap
+                    self._remove_entity(in_entity)
+                    self._add_entity(out_entity)
+                    score = self._score()
+                    improvement = score - initial_score
+                    # Undo swap
+                    self._add_entity(in_entity)
+                    self._remove_entity(out_entity)
 
-        # Phase 2: Swaps
-        phase2_rounds = 0
-        if self.config.enable_swaps:
-            print("\nPhase 2: Swap refinement")
-            self.network = self._phase_swaps(self.network, history, moves)
-            phase2_rounds = len([m for m in moves if m.move_type == "swap"])
+                    if improvement > best_improvement:
+                        best_improvement = improvement
+                        best_score = score
+                        best_swap = (in_entity, out_entity)
 
-        final_score, detail = self.evaluate(self.network)
-        total_time = time.time() - start_time
+            # Check convergence
+            if self.config.convergence_threshold > 0:
+                relative = best_improvement / max(initial_score, 0.001)
+                if relative < self.config.convergence_threshold:
+                    self._log(f"  Converged at round {round_num + 1}")
+                    break
 
-        print(f"\nFinal score: {final_score:.4f}")
-        print(f"Final network: {len(self.network)} groups")
-        print(f"Moves: {len(moves)} ({phase1_rounds} additions, {phase2_rounds} swaps)")
-        print(f"Time: {total_time:.2f}s")
+            if best_swap is None or best_improvement <= 0:
+                no_improve_count += 1
+                self._log(f"  Round {round_num + 1}: No improvement, {no_improve_count}/{self.config.patience} no-improve")
+                if no_improve_count >= self.config.patience:
+                    self._log(f"  Stopping after {no_improve_count} rounds without improvement")
+                    break
+                continue
 
-        return OptimizationResult(
-            best_network=self.network,
-            final_score=final_score,
-            initial_score=initial_score,
-            performance_history=history,
-            moves=moves,
-            phase1_rounds=phase1_rounds,
-            phase2_rounds=phase2_rounds,
-            total_time=total_time,
-            adequacy_detail=detail,
+            # Commit best swap
+            in_e, out_e = best_swap
+            self._remove_entity(in_e)
+            self._add_entity(out_e)
+            swapped.append((in_e, out_e))
+            initial_score = best_score
+            no_improve_count = 0
+
+            if self.config.verbosity >= 2:
+                self._log(f"  Round {round_num + 1}: Swapped '{in_e}' → '{out_e}' → score {best_score:.2f}% (+{best_improvement:.2f}%)")
+
+        self._log(f"  Phase 2 complete: {len(swapped)} swaps, score {initial_score:.2f}%")
+
+        self.phases.append({
+            "phase": 2,
+            "swaps": len(swapped),
+            "final_score": initial_score,
+            "elapsed": time.time() - start_time,
+        })
+
+        return swapped
+
+    def optimize(self) -> SearchResult:
+        """Run the full optimization."""
+        overall_start = time.time()
+        entities_added = []
+        entities_swapped = []
+
+        if not self.config.swap_only:
+            entities_added = self.phase1_additions()
+
+        entities_swapped = self.phase2_swaps()
+
+        final_network = self._get_network_df()
+        final_score = self._score()
+        elapsed = time.time() - overall_start
+
+        self._log(f"\n=== Final Score: {final_score:.2f}% ===")
+        self._log(f"  Entities in network: {len(self.network_entities)}")
+        self._log(f"  Providers in network: {len(final_network)}")
+        self._log(f"  Time: {elapsed:.1f}s")
+
+        return SearchResult(
+            network=final_network,
+            score=final_score,
+            elapsed=elapsed,
+            entities_added=entities_added,
+            entities_swapped=entities_swapped,
+            network_entities=set(self.network_entities),
         )

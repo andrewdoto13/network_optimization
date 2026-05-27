@@ -1,82 +1,121 @@
-"""Distance computation with BallTree-based coverage queries."""
+"""Distance computation and BallTree coverage queries."""
 
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import BallTree
 
 
-def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Compute haversine distance in miles between two points."""
-    radius_earth = 3958.8  # Earth radius in miles
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    return radius_earth * 2 * np.arcsin(np.sqrt(a))
-
-
-def build_balltree(providers: pd.DataFrame) -> BallTree:
-    """Build BallTree from provider coordinates.
-
-    Args:
-        providers: DataFrame with 'latitude' and 'longitude' columns.
+def build_balltree(df: pd.DataFrame) -> tuple[dict, dict]:
+    """Build a BallTree per specialty from provider data.
 
     Returns:
-        BallTree instance with radians coordinates.
+        specialty_trees: dict mapping specialty -> BallTree
+        specialty_indices: dict mapping specialty -> list of provider indices
     """
-    coords = np.radians(providers[["latitude", "longitude"]].values)
-    return BallTree(coords, metric="haversine")
+    specialty_trees = {}
+    specialty_indices = {}
+
+    for specialty, group in df.groupby("specialty"):
+        coords = group[["lat", "lon"]].values * (np.pi / 180.0)
+        tree = BallTree(coords, leaf_size=40, metric="haversine")
+        specialty_trees[specialty] = tree
+        specialty_indices[specialty] = list(group.index)
+
+    return specialty_trees, specialty_indices
 
 
-def compute_access(
-    providers: pd.DataFrame,
+def miles_to_radians(miles: float, earth_radius: float = 3958.8) -> float:
+    """Convert miles to radians for haversine distance."""
+    return miles / earth_radius
+
+
+def compute_coverage(
+    pool: pd.DataFrame,
     members: pd.DataFrame,
-    adequacy_reqs: pd.DataFrame,
-) -> pd.DataFrame:
-    """Compute per-member accessible provider counts per (county, specialty).
+    thresholds: dict,
+    network: pd.DataFrame,
+) -> list[dict]:
+    """Compute per-county-and-specialty member coverage.
 
-    Uses BallTree radius queries instead of cross-join for scalability.
+    For each (state, county, specialty) threshold:
+        - Filter network to matching specialty
+        - Build BallTree for those providers
+        - Query each member's location for providers within distance threshold
+        - Count members with at least one provider in range
 
-    Args:
-        providers: Provider DataFrame with specialty, county, latitude, longitude.
-        members: Member DataFrame with county, latitude, longitude.
-        adequacy_reqs: Requirements DataFrame with specialty, county, distance_req, provider_count.
-
-    Returns:
-        DataFrame with columns: member_id, county, specialty, accessible_provider_count.
+    Returns list of coverage result dicts matching agent format.
     """
-    results = []
+    coverage_results = []
 
-    for _, req_row in adequacy_reqs.iterrows():
-        specialty = req_row["specialty"]
-        county = req_row["county"]
-        distance_deg = req_row["distance_req"] / 3958.8  # miles to radians
+    for state_val, counties in thresholds.items():
+        for county_val, specialties in counties.items():
+            # Filter members to this county
+            county_mask = members["county"].astype(str).str.lower() == county_val.lower()
+            if "state" in members.columns:
+                state_mask = members["state"].astype(str).str.lower() == state_val.lower()
+                county_mask = county_mask & state_mask
+            county_members = members[county_mask]
 
-        # Filter providers by specialty
-        spec_providers = providers[providers["specialty"] == specialty]
-        if spec_providers.empty:
-            continue
+            if county_members.empty:
+                for specialty, _threshold in specialties.items():
+                    coverage_results.append({
+                        "state": state_val,
+                        "county": county_val,
+                        "specialty": specialty,
+                        "members_with_access": 0,
+                        "total_members": 0,
+                        "coverage_percentage": 0.0,
+                    })
+                continue
 
-        # Filter members by county
-        county_members = members[members["county"] == county]
-        if county_members.empty:
-            continue
+            group_pts = county_members[["lat", "lon"]].values * (np.pi / 180.0)
 
-        # Build BallTree on specialty providers
-        tree = build_balltree(spec_providers)
+            for specialty, threshold in specialties.items():
+                # Filter network to this specialty
+                specialty_network = network[network["specialty"].str.lower() == specialty.lower()]
 
-        # Query each member for providers within distance
-        member_coords = np.radians(county_members[["latitude", "longitude"]].values)
-        indices, _ = tree.query_radius(member_coords, r=distance_deg, return_distance=True)
+                if specialty_network.empty:
+                    coverage_results.append({
+                        "state": state_val,
+                        "county": county_val,
+                        "specialty": specialty,
+                        "members_with_access": 0,
+                        "total_members": len(county_members),
+                        "coverage_percentage": 0.0,
+                    })
+                    continue
 
-        for i, member_id in enumerate(county_members["member_id"]):
-            results.append(
-                {
-                    "member_id": member_id,
-                    "county": county,
+                # Build BallTree and query
+                radius_rad = miles_to_radians(threshold)
+                tree = BallTree(
+                    specialty_network[["lat", "lon"]].values * (np.pi / 180.0),
+                    leaf_size=40,
+                    metric="haversine",
+                )
+                indices, _ = tree.query_radius(group_pts, r=radius_rad, return_distance=True)
+
+                members_with_access = int(np.array([len(lst) > 0 for lst in indices]).sum())
+                total_members = len(county_members)
+                coverage_pct = round(members_with_access / total_members * 100, 2) if total_members > 0 else 0.0
+
+                coverage_results.append({
+                    "state": state_val,
+                    "county": county_val,
                     "specialty": specialty,
-                    "accessible_provider_count": len(indices[i]),
-                }
-            )
+                    "members_with_access": members_with_access,
+                    "total_members": total_members,
+                    "coverage_percentage": coverage_pct,
+                })
 
-    return pd.DataFrame(results)
+    coverage_results.sort(key=lambda x: (x.get("state", ""), x["county"], x["specialty"]))
+    return coverage_results
+
+
+def compute_score(coverage_results: list[dict]) -> float:
+    """Compute overall adequacy score from coverage results.
+
+    Score = mean coverage percentage across all (county, specialty) thresholds.
+    """
+    if not coverage_results:
+        return 0.0
+    return sum(r["coverage_percentage"] for r in coverage_results) / len(coverage_results)
