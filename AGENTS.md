@@ -1,5 +1,11 @@
 # Agent Instructions: Network Optimizer
 
+## Setup
+- **Python**: 3.9.6 (system)
+- **Venv**: `.venv/` — already created and configured
+- **Activate**: `source .venv/bin/activate`
+- **Install deps**: `pip install -e ".[dev]"` (editable install with dev tools)
+
 ## Developer Commands
 - **Activate venv**: `source .venv/bin/activate`
 - **Run Optimizer**: `run-optimizer` (or `python -m network_optimizer`)

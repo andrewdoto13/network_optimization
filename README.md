@@ -20,6 +20,8 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
+Requires Python 3.9+. Venv (`.venv/`) is pre-configured in the repo.
+
 ## Usage
 
 ```bash
