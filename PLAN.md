@@ -125,6 +125,10 @@ network_optimization/
    - Swap evaluation = remove entity A's contribution, add entity B's contribution
    - Reduces O(K × (N-K)) full evaluations to O(K × (N-K)) delta computations
    - Critical for large pools (500+ entities × 250K swap combinations)
+2. **Size-constrained optimization** — "best N entities" mode
+   - User observation: trimming a network = treat current network as pool, start from scratch
+   - Works today but limited: can only select from existing entities, misses better candidates in full pool
+   - Ideal: "give me best N from (current network + full pool)" — requires hard size cap or swap-with-shrink
 
 ### Phase 5: Test suite
 1. `conftest.py` — Small/large synthetic fixtures
