@@ -23,3 +23,6 @@ build/
 
 # Logs
 logs/
+
+# Linting
+.ruff_cache/
