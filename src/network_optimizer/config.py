@@ -22,6 +22,7 @@ class OptimizerConfig:
     patience: int = 5
     time_budget: float | None = None
     convergence_threshold: float = 0.0  # Stop when improvement < this % of current score
+    n_jobs: int = 1  # Parallel workers for candidate scoring (1 = sequential)
 
     # Phase control
     enable_swaps: bool = False
@@ -48,6 +49,8 @@ class OptimizerConfig:
             raise ValueError("convergence_threshold must be in [0, 1]")
         if self.verbosity not in (0, 1, 2):
             raise ValueError("verbosity must be 0, 1, or 2")
+        if self.n_jobs < 1:
+            raise ValueError("n_jobs must be >= 1")
 
     @classmethod
     def quick(cls) -> OptimizerConfig:

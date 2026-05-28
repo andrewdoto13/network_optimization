@@ -7,6 +7,7 @@ Phase 2: Swap refinement — swap one network entity for one outside entity.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -14,6 +15,30 @@ import pandas as pd
 
 from .config import OptimizerConfig
 from .scoring import adequacy_score
+
+
+def _score_candidate(
+    entity_map: dict[str, pd.DataFrame],
+    base_entities: frozenset[str],
+    candidate_entity: str,
+    remove_entity: str | None,
+    members: pd.DataFrame,
+    thresholds: dict,
+    objective: Callable[[pd.DataFrame], float] | None,
+) -> tuple[str, float]:
+    """Score a candidate entity addition (or swap) in isolation.
+
+    Used as the target function for ThreadPoolExecutor.
+    """
+    entities = set(base_entities)
+    if remove_entity is not None:
+        entities.discard(remove_entity)
+    entities.add(candidate_entity)
+
+    network_df = pd.DataFrame() if not entities else pd.concat([entity_map[e] for e in entities], ignore_index=True)
+
+    score = objective(network_df) if objective is not None else adequacy_score(members, thresholds, network_df)
+    return (candidate_entity, score)
 
 
 @dataclass
@@ -52,22 +77,20 @@ class NetworkOptimizer:
         all_entities = set(pool["entity"].dropna().str.lower().unique())
         self.outside_entities = all_entities - self.network_entities
 
-        # Pre-compute entity -> provider mapping
-        self.entity_map = {}
-        for entity, group in pool.dropna(subset=["entity"]).groupby("entity"):
-            self.entity_map[entity.lower()] = group
+        # Pre-compute entity -> provider mapping (keys lowercased to match network_entities)
+        entity_lower = pool["entity"].dropna().str.lower()
+        self.entity_map: dict[str, pd.DataFrame] = {}
+        for entity, group in pool.assign(_el=entity_lower).groupby("_el", sort=False):
+            self.entity_map[entity] = group.drop(columns=["_el"])
 
-        # Scoring cache
-        self._last_score: float | None = None
-        self._last_network_hash: int | None = None
         self.phases: list[dict] = []
 
     def _get_network_df(self) -> pd.DataFrame:
-        """Reconstruct network DataFrame from current entity set."""
+        """Reconstruct network DataFrame from current entity set using entity_map."""
         entities = sorted(self.network_entities)
         if not entities:
             return self.pool.iloc[:0].copy()
-        return self.pool[self.pool["entity"].dropna().str.lower().isin(entities)].reset_index(drop=True)
+        return pd.concat([self.entity_map[e] for e in entities], ignore_index=True)
 
     def _score(self) -> float:
         """Score current network, with caching."""
@@ -114,16 +137,45 @@ class NetworkOptimizer:
             best_score = initial_score
             best_improvement = 0.0
 
-            for entity in sorted(self.outside_entities):
-                self._add_entity(entity)
-                score = self._score()
-                improvement = score - initial_score
-                self._remove_entity(entity)
+            candidates = sorted(self.outside_entities)
+            use_parallel = (
+                self.config.n_jobs > 1
+                and len(candidates) > self.config.n_jobs
+            )
 
-                if improvement > best_improvement:
-                    best_improvement = improvement
-                    best_score = score
-                    best_entity = entity
+            if use_parallel:
+                with ThreadPoolExecutor(max_workers=self.config.n_jobs) as executor:
+                    futures = [
+                        executor.submit(
+                            _score_candidate,
+                            self.entity_map,
+                            frozenset(self.network_entities),
+                            entity,
+                            None,
+                            self.members,
+                            self.thresholds,
+                            self._objective,
+                        )
+                        for entity in candidates
+                    ]
+                    for future in futures:
+                        entity, score = future.result()
+                        improvement = score - initial_score
+                        if improvement > best_improvement:
+                            best_improvement = improvement
+                            best_score = score
+                            best_entity = entity
+            else:
+                for entity in candidates:
+                    self._add_entity(entity)
+                    score = self._score()
+                    improvement = score - initial_score
+                    self._remove_entity(entity)
+
+                    if improvement > best_improvement:
+                        best_improvement = improvement
+                        best_score = score
+                        best_entity = entity
 
             # Check convergence
             if self.config.convergence_threshold > 0:
@@ -191,21 +243,56 @@ class NetworkOptimizer:
             best_score = initial_score
             best_improvement = 0.0
 
-            for in_entity in sorted(self.network_entities):
-                for out_entity in sorted(self.outside_entities):
-                    # Try swap
-                    self._remove_entity(in_entity)
-                    self._add_entity(out_entity)
-                    score = self._score()
-                    improvement = score - initial_score
-                    # Undo swap
-                    self._add_entity(in_entity)
-                    self._remove_entity(out_entity)
+            in_entities = sorted(self.network_entities)
+            out_entities = sorted(self.outside_entities)
+            use_parallel = (
+                self.config.n_jobs > 1
+                and len(in_entities) * len(out_entities) > self.config.n_jobs
+            )
 
-                    if improvement > best_improvement:
-                        best_improvement = improvement
-                        best_score = score
-                        best_swap = (in_entity, out_entity)
+            if use_parallel:
+                tasks = [
+                    (in_e, out_e)
+                    for in_e in in_entities
+                    for out_e in out_entities
+                ]
+                with ThreadPoolExecutor(max_workers=self.config.n_jobs) as executor:
+                    futures = [
+                        executor.submit(
+                            _score_candidate,
+                            self.entity_map,
+                            frozenset(self.network_entities),
+                            out_e,
+                            in_e,
+                            self.members,
+                            self.thresholds,
+                            self._objective,
+                        )
+                        for in_e, out_e in tasks
+                    ]
+                    for idx, future in enumerate(futures):
+                        _, score = future.result()
+                        improvement = score - initial_score
+                        if improvement > best_improvement:
+                            best_improvement = improvement
+                            best_score = score
+                            best_swap = tasks[idx]
+            else:
+                for in_entity in in_entities:
+                    for out_entity in out_entities:
+                        # Try swap
+                        self._remove_entity(in_entity)
+                        self._add_entity(out_entity)
+                        score = self._score()
+                        improvement = score - initial_score
+                        # Undo swap
+                        self._add_entity(in_entity)
+                        self._remove_entity(out_entity)
+
+                        if improvement > best_improvement:
+                            best_improvement = improvement
+                            best_score = score
+                            best_swap = (in_entity, out_entity)
 
             # Check convergence
             if self.config.convergence_threshold > 0:

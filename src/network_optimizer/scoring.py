@@ -42,25 +42,10 @@ def compute_coverage(
             for specialty in specialties
         ]
 
-    # Pre-compute lookup arrays
-    member_state = members["state"].astype(str).str.lower().values
-    member_county = members["county"].astype(str).str.lower().values
-    provider_specialty = network["specialty"].astype(str).str.lower().values
+    # Pre-compute per-(state, county) member index groups
+    county_groups = members.groupby(["state", "county"], sort=False).groups
     member_pts = members[["lat", "lon"]].values * (np.pi / 180.0)
-
-    # Pre-compute per-(state, county) member indices and totals
-    county_member_lists: dict[tuple[str, str], list[int]] = {}
-    for i, (s, c) in enumerate(zip(member_state, member_county)):
-        key = (s, c)
-        if key not in county_member_lists:
-            county_member_lists[key] = []
-        county_member_lists[key].append(i)
-
-    county_members: dict[tuple[str, str], np.ndarray] = {}
-    county_totals: dict[tuple[str, str], int] = {}
-    for key, idx_list in county_member_lists.items():
-        county_members[key] = np.array(idx_list)
-        county_totals[key] = len(idx_list)
+    provider_specialty = network["specialty"].astype(str).str.lower().values
 
     # Build per-specialty BallTrees
     provider_pts = network[["lat", "lon"]].values * (np.pi / 180.0)
@@ -77,7 +62,8 @@ def compute_coverage(
             state_key = state_val.lower()
             county_key = county_val.lower()
             county_key_pair = (state_key, county_key)
-            total_in_county = county_totals.get(county_key_pair, 0)
+            member_idx = county_groups.get(county_key_pair)
+            total_in_county = len(member_idx) if member_idx is not None else 0
 
             if total_in_county == 0:
                 for specialty in specialties:
@@ -89,7 +75,7 @@ def compute_coverage(
                     })
                 continue
 
-            county_pts = member_pts[county_members[county_key_pair]]
+            county_pts = member_pts[member_idx]
 
             for specialty, threshold in specialties.items():
                 spec_key = specialty.lower()

@@ -28,6 +28,7 @@ def main() -> None:
     parser.add_argument("--convergence", type=float, default=0.0, help="Convergence threshold (0-1)")
     parser.add_argument("--verbosity", type=int, choices=[0, 1, 2], default=1, help="Verbosity level")
     parser.add_argument("--min-entity-size", type=int, default=None, help="Min providers per entity (filters pool)")
+    parser.add_argument("--n-jobs", type=int, default=1, help="Parallel workers for candidate scoring (1 = sequential)")
     parser.add_argument("--quick", action="store_true", help="Quick test mode (10 rounds, no swaps)")
 
     args = parser.parse_args()
@@ -60,6 +61,7 @@ def main() -> None:
         time_budget=args.time_budget,
         convergence_threshold=args.convergence,
         verbosity=args.verbosity,
+        n_jobs=args.n_jobs,
     )
 
     optimizer = NetworkOptimizer(pool, members, thresholds, initial_network, config)
