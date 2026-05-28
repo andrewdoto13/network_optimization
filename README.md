@@ -11,7 +11,7 @@ Two-phase local search (steepest ascent):
 1. **Phase 1 (Construct):** Greedy additions — add entities one at a time, picking the biggest score improvement.
 2. **Phase 2 (Refine):** Fixed-network-size swap refinement — trade poorly-placed entities for better ones.
 
-Uses `sklearn.neighbors.BallTree` for efficient haversine distance queries — O(M log P) instead of O(M × P) cross joins.
+Uses `sklearn.neighbors.BallTree` for efficient haversine distance queries — O(M log P) instead of O(M × P) cross joins. Per-specialty BallTree + per-county query approach avoids N×C tree rebuilds.
 
 ## Install
 
@@ -24,32 +24,25 @@ Requires Python 3.9+. Venv (`.venv/`) is pre-configured in the repo.
 
 ## Usage
 
+### Real data (Michigan market)
+
 ```bash
 run-optimizer \
-  --pool data/synth/candidates.csv \
-  --members data/synth/members.csv \
-  --thresholds data/synth/thresholds.json \
-  --network data/synth/network.csv \
-  --max-rounds 100 \
+  --pool data/mi_market_data.csv \
+  --members data/mi_members_sample.csv \
+  --thresholds data/thresholds.json \
+  --min-entity-size 20 \
+  --max-rounds 50 \
   --enable-swaps
-```
-
-Or start with an empty network:
-
-```bash
-run-optimizer \
-  --pool data/synth/candidates.csv \
-  --members data/synth/members.csv \
-  --thresholds data/synth/thresholds.json
 ```
 
 Quick test mode (10 rounds, no swaps):
 
 ```bash
 run-optimizer \
-  --pool data/synth/candidates.csv \
-  --members data/synth/members.csv \
-  --thresholds data/synth/thresholds.json \
+  --pool data/mi_market_data.csv \
+  --members data/mi_members_sample.csv \
+  --thresholds data/thresholds.json \
   --quick
 ```
 
@@ -61,6 +54,7 @@ run-optimizer \
 | `--members` | Member locations CSV (required) |
 | `--thresholds` | Distance thresholds JSON (required) |
 | `--network` | Initial network CSV (optional) |
+| `--min-entity-size` | Minimum providers per entity to include in pool |
 | `--max-rounds` | Max rounds per phase (default: 100) |
 | `--patience` | No-improvement rounds before stopping (default: 5) |
 | `--enable-swaps` | Enable Phase 2 swap refinement |
@@ -73,15 +67,14 @@ run-optimizer \
 
 ## Data
 
-### Schema (agent-compatible)
+### Schema
 
 **Pool / Network** — provider-level data with entity grouping:
-- `id`, `entity`, `specialty`, `lat`, `lon`, `state`, `county`, `city`
-- `effectiveness`, `efficiency`, `location_confidence`
-- Claims volume/amount columns
+- Required: `id`, `entity`, `specialty`, `lat`, `lon`, `state`, `effectiveness`, `efficiency`
+- Optional: `county`, `city`, `location_confidence`, claims volume/amount columns
 
 **Members** — member locations:
-- `id`, `state`, `county`, `lat`, `lon`
+- Required: `id`, `state`, `county`, `lat`, `lon`
 
 **Thresholds** — nested JSON format:
 ```json
@@ -98,26 +91,50 @@ run-optimizer \
 
 Binary coverage: member has access if **any** provider of matching specialty is within the distance threshold.
 
-### Generate synthetic data
+### Included datasets
 
-```bash
-python scripts/generate_data.py \
-  --num-entities 50 \
-  --num-members 1000 \
-  --seed 42 \
-  --output-dir data/synth/
-```
+| File | Description |
+|---|---|
+| `data/mi_market_data.csv` | 124K providers, 13.8K entities, 46 specialties (MI market) |
+| `data/MedicareSampleCensus2023Q4.csv` | 2.2M members, 83 counties (national sample) |
+| `data/mi_members_sample.csv` | 10K MI members (testing subset) |
+| `data/thresholds.json` | 10 MI counties × 10 specialties (100 thresholds) |
+
+Raw pool data is normalized automatically: column renames (`Primary Contract Entity` → `entity`), scaled coordinates (÷1M, Western hemisphere longitude negation), string lowercasing, NaN entity/specialty filtering.
 
 ## Performance
 
-Synthetic data: 233 providers, 50 entities, 1000 members, 3 counties, 30 thresholds.
+### Real data benchmarks (MI market, 10K members, 100 thresholds)
 
-| Starting network | Final score | Entities | Time |
+| Pool filter | Entities | Score | Time |
 |---|---|---|---|
-| Empty | 31.52% | 10 | 16s |
-| 5 entities | 38.62% | 15 | 17s |
+| 20+ providers | 479 | 95.33% | 116s (2 rounds) |
+| 5+ providers | 2,122 | — | ~28 min/round |
+
+Scoring: `adequacy_score` call = 0.79s for full 124K provider pool.
 
 Score = mean coverage % across all (county, specialty) thresholds.
+
+## Custom Objectives
+
+The optimizer supports custom objective functions. Pass any `(network) -> float` callable:
+
+```python
+from network_optimizer import NetworkOptimizer, adequacy_score, compute_coverage
+
+# Example: combine adequacy with provider effectiveness
+def my_objective(network):
+    if len(network) == 0:
+        return 0.0
+    adequacy = adequacy_score(members, thresholds, network)
+    effectiveness = network["effectiveness"].mean()
+    return adequacy * 0.7 + effectiveness * 0.3
+
+optimizer = NetworkOptimizer(pool, members, thresholds, initial_network, objective=my_objective)
+result = optimizer.optimize()
+```
+
+Use `compute_coverage()` to build more complex objectives with per-county/specialty breakdowns.
 
 ## Project Structure
 
@@ -125,24 +142,25 @@ Score = mean coverage % across all (county, specialty) thresholds.
 network_optimization/
 ├── src/network_optimizer/     # Package
 │   ├── config.py              # OptimizerConfig dataclass + validation
-│   ├── data.py                # Data loading, validation
-│   ├── distance.py            # BallTree-based coverage queries
-│   ├── adequacy.py            # Adequacy scoring
+│   ├── data.py                # Data loading, validation, raw-format normalization
+│   ├── scoring.py             # BallTree coverage queries + adequacy scoring
 │   ├── search.py              # Two-phase local search
 │   └── main.py                # CLI entry point
-├── tests/                     # [TODO] pytest suite
-├── notebooks/                 # [TODO] demo.ipynb
+├── data/                      # Real datasets
+│   ├── mi_market_data.csv     # 124K providers
+│   ├── MedicareSampleCensus2023Q4.csv  # 2.2M members
+│   ├── mi_members_sample.csv  # 10K MI subset
+│   └── thresholds.json        # 100 thresholds
 ├── scripts/
-│   └── generate_data.py       # Synthetic data generator
-└── reports/                   # [TODO] benchmark results
+│   └── generate_data.py       # Synthetic data generator (legacy)
+└── tests/                     # [TODO] pytest suite
 ```
 
 ## Development
 
 ```bash
-pytest              # Run tests
-ruff check .        # Lint
-mypy src/network_optimizer  # Type check
+ruff check .                   # Lint (use --fix --unsafe-fixes)
+mypy src/network_optimizer     # Type check (disallow_untyped_defs = false)
 ```
 
 ## License

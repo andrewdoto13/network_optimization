@@ -1,6 +1,0 @@
-specialty,county,provider_count,distance_req,min_access_pct,min_providers
-cardiologist,wayne,1,15,90,5
-pcp,wayne,2,15,90,10
-ent,wayne,1,15,90,5
-urologist,wayne,1,15,90,5
-obgyn,wayne,1,15,90,5

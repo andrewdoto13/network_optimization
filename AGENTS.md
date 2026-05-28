@@ -1,72 +1,45 @@
 # Agent Instructions: Network Optimizer
 
 ## Setup
-- **Python**: 3.9.6 (system)
-- **Venv**: `.venv/` — already created and configured
+- **Python**: 3.9+ | **Venv**: `.venv/` (pre-created)
 - **Activate**: `source .venv/bin/activate`
-- **Install deps**: `pip install -e ".[dev]"` (editable install with dev tools)
+- **Install deps**: `pip install -e ".[dev]"`
 
-## Developer Commands
-- **Activate venv**: `source .venv/bin/activate`
-- **Run Optimizer**: `run-optimizer` (or `python -m network_optimizer`)
-- **CLI Options**:
-    - `--pool <path>`: Provider pool CSV (required)
-    - `--members <path>`: Members CSV (required)
-    - `--thresholds <path>`: Distance thresholds JSON (required)
-    - `--network <path>`: Initial network CSV (optional, starts empty if omitted)
-    - `--max-rounds <N>`: Max rounds per phase (default: 100)
-    - `--patience <N>`: Consecutive no-improvement rounds to stop early (default: 5)
-    - `--enable-swaps`: Run phase 2 (swap refinement)
-    - `--swap-only`: Skip phase 1, only do swaps
-    - `--time-budget <seconds>`: Max runtime in seconds
-    - `--convergence <0-1>`: Relative convergence threshold (default: 0)
-    - `--verbosity <0|1|2>`: 0=silent, 1=summary, 2=per-round (default: 1)
-    - `--output <path>`: Write results to JSON file
-    - `--quick`: Quick test mode (10 rounds, no swaps)
-- **Run Tests**: `pytest`
-- **Lint**: `ruff check .`
-- **Type Check**: `mypy src/network_optimizer`
-- **Install**: `pip install -e ".[dev]"`
+## Commands
+- **Run**: `run-optimizer` or `python -m network_optimizer` (entry point: `src/network_optimizer/main.py`)
+- **CLI**: `--pool`, `--members`, `--thresholds` required; `--network` optional (starts empty). See README for full option list.
+- **Quick smoke test**: `run-optimizer --pool data/mi_market_data.csv --members data/mi_members_sample.csv --thresholds data/thresholds.json --quick`
+- **Real data test (fast)**: `run-optimizer --pool data/mi_market_data.csv --members data/mi_members_sample.csv --thresholds data/thresholds.json --min-entity-size 20 --max-rounds 2`
+- **Lint**: `ruff check .` (selects: E F W I N UP B SIM; use `--fix --unsafe-fixes`)
+- **Type check**: `mypy src/network_optimizer` (note: `disallow_untyped_defs = false`)
 
-## Architecture & Key Files
-- **Approach**: Deterministic local search (steepest ascent) with two-phase search.
-- **Core Logic**:
-    - `src/network_optimizer/__init__.py`: Package exports, version `0.1.0`.
-    - `src/network_optimizer/config.py`: `OptimizerConfig` dataclass with `__post_init__` validation.
-    - `src/network_optimizer/data.py`: Load pool/members/thresholds, validate columns, normalize state/county.
-    - `src/network_optimizer/distance.py`: BallTree-based haversine distance queries for coverage computation.
-    - `src/network_optimizer/adequacy.py`: Score = mean coverage % across all (county, specialty) thresholds.
-    - `src/network_optimizer/search.py`: `NetworkOptimizer` — two-phase local search (additions then swaps).
-    - `src/network_optimizer/main.py`: CLI entry point with argparse.
-- **Data**: Synthetic test data in `data/synth/`. Schema matches `network_manager_agent` project.
-- **Scripts**: `scripts/generate_data.py` — generate synthetic data matching agent schema.
-- **Interactive Dev**: `notebooks/demo.ipynb` (TODO).
-- **Reports**: Benchmark results in `reports/` directory (TODO).
+## Architecture
+`src/network_optimizer/` — deterministic two-phase local search (steepest ascent). No LLM, pure algorithmic.
 
-## Data Schema (agent-compatible)
+| File | Purpose |
+|---|---|
+| `__init__.py` | Exports: `OptimizerConfig`, `NetworkOptimizer`, `SearchResult`, `adequacy_score`, `compute_coverage`, `load_*` |
+| `__main__.py` | Enables `python -m network_optimizer` |
+| `main.py` | CLI entry point (argparse) |
+| `config.py` | `OptimizerConfig` dataclass with `__post_init__` validation |
+| `data.py` | Load/validate pool, members, thresholds; raw-format normalization (column renames, coordinate scaling, string lowercasing, NaN filtering) |
+| `scoring.py` | BallTree coverage queries + adequacy scoring (`adequacy_score`, `compute_coverage`, `miles_to_radians`) |
+| `search.py` | `NetworkOptimizer` — phase 1 (greedy adds), phase 2 (swaps), supports custom `objective` callable |
 
-### Pool / Network (provider-level)
-- Grouping key: `entity` (string name, e.g. "Beaumont Health")
-- Required columns: `id`, `entity`, `specialty`, `lat`, `lon`, `state`, `county`, `effectiveness`, `efficiency`
-- Optional: `city`, `location_confidence`, claims volume/amount columns
+## Data Schema
+- **Pool / Network** (provider-level, grouped by `entity`): `id`, `entity`, `specialty`, `lat`, `lon`, `state`, `effectiveness`, `efficiency` (+ optional `county`, city, location_confidence, claims)
+- **Members**: `id`, `state`, `county`, `lat`, `lon`
+- **Thresholds** (JSON): `{state: {county: {specialty: distance_miles}}}` — binary coverage (member covered if any matching provider within distance)
 
-### Members
-- Required columns: `id`, `state`, `county`, `lat`, `lon`
+## Key Patterns
+- **Two-phase search**: Phase 1 adds entities greedily until convergence. Phase 2 swaps entities at fixed network size. No standalone removals (never improve pure adequacy).
+- **BallTree coverage**: Per-specialty BallTree on provider coords. Per-county threshold via `query_radius`. Avoids O(M × P) cross join. 14x speedup on large networks vs per-county rebuild.
+- **Custom objectives**: `NetworkOptimizer` accepts `objective: Callable[[pd.DataFrame], float] | None`. Default is `adequacy_score`; pass any `(network) -> float` function for custom scoring.
+- **Python 3.9**: Use `from __future__ import annotations` for `X | None`, `list[X]` syntax.
+- **Ruff isort**: `scripts` is `known-first-party` alongside `network_optimizer`.
 
-### Thresholds (JSON)
-- Nested format: `{state: {county: {specialty: distance_miles}}}`
-- Binary coverage: member has access if **any** provider of matching specialty is within distance
-
-## Key Logic & Patterns
-- **Two-Phase Search**: Phase 1 (construct) — greedy entity additions until convergence. Phase 2 (refine) — fixed-size swap refinement. No standalone removals.
-- **BallTree Coverage**: Build BallTree on provider locations per specialty. For each member, query providers within distance threshold via `query_radius`. O(M log P) instead of O(M × P) cross join.
-- **Adequacy Scoring**: Score = mean coverage % across all (county, specialty) thresholds. Coverage = fraction of members with at least one provider in range.
-- **Multi-Region**: Thresholds JSON has per-county distance rules. BallTree queries use per-county thresholds.
-- **Python 3.9**: Use `from __future__ import annotations` for modern type hint syntax (`X | None`, `list[X]`).
-
-## Important Notes
-- **No LLM**: This is a deterministic optimizer — no language model involved. Pure algorithmic approach.
-- **Move Types**: Additions (phase 1), swaps (phase 2). Removals alone never improve a pure adequacy objective.
-- **Incremental Evaluation**: TODO — cache baseline coverage per entity, compute deltas for swap evaluation instead of full recalculation.
-- **Lint**: `ruff` with E, F, W, I, N, UP, B, SIM selects. Use `--fix --unsafe-fixes` for auto-fixes.
-- **Type hints**: Use `from __future__ import annotations` + modern syntax (`X | None`, `list[X]`, `tuple[X, Y]`).
+## Performance Notes
+- `adequacy_score` on full pool (124K providers, 10K members, 100 thresholds): ~0.79s
+- One Phase 1 round with 479 entities (20+ providers): ~58s
+- One Phase 1 round with 2,122 entities (5+ providers): ~28 min
+- Use `--min-entity-size` to reduce search space

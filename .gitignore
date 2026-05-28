@@ -26,3 +26,15 @@ logs/
 
 # Linting
 .ruff_cache/
+
+# Large datasets
+data/mi_market_data.csv
+data/MedicareSampleCensus2023Q4.csv
+data/MedicareSampleCensus2023Q4_mi.csv
+data/mi_members_sample.csv
+
+# Large datasets (too big for git)
+data/mi_market_data.csv
+data/MedicareSampleCensus2023Q4.csv
+data/MedicareSampleCensus2023Q4_mi.csv
+data/mi_members_sample.csv

@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--time-budget", type=float, default=None, help="Time budget in seconds")
     parser.add_argument("--convergence", type=float, default=0.0, help="Convergence threshold (0-1)")
     parser.add_argument("--verbosity", type=int, choices=[0, 1, 2], default=1, help="Verbosity level")
+    parser.add_argument("--min-entity-size", type=int, default=None, help="Min providers per entity (filters pool)")
     parser.add_argument("--quick", action="store_true", help="Quick test mode (10 rounds, no swaps)")
 
     args = parser.parse_args()
@@ -41,6 +42,15 @@ def main() -> None:
     pool, members, thresholds, initial_network = load_all(
         args.pool, args.members, args.thresholds, args.network
     )
+
+    # Filter pool to entities with min N providers
+    if args.min_entity_size is not None:
+        entity_sizes = pool.groupby("entity").size()
+        qualifying = set(entity_sizes[entity_sizes >= args.min_entity_size].index)
+        before = len(pool)
+        pool = pool[pool["entity"].isin(qualifying)].reset_index(drop=True)
+        initial_network = initial_network[initial_network["entity"].isin(qualifying)].reset_index(drop=True)
+        print(f"  Filtered pool: {before} -> {len(pool)} providers ({pool['entity'].nunique()} entities with >= {args.min_entity_size} providers)")
 
     config = OptimizerConfig(
         max_rounds=args.max_rounds,

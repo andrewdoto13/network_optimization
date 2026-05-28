@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Required columns matching agent schema
+# Required columns for provider pool (county is optional - BallTree handles geographic matching)
 POOL_REQUIRED = frozenset({
-    "id", "entity", "specialty", "lat", "lon", "state", "county",
+    "id", "entity", "specialty", "lat", "lon", "state",
     "effectiveness", "efficiency",
 })
 

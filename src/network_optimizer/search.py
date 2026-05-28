@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 import pandas as pd
 
-from .adequacy import score_network
 from .config import OptimizerConfig
+from .scoring import adequacy_score
 
 
 @dataclass
@@ -37,20 +38,23 @@ class NetworkOptimizer:
         thresholds: dict,
         initial_network: pd.DataFrame,
         config: OptimizerConfig | None = None,
+        objective: Callable[[pd.DataFrame], float] | None = None,
     ):
         self.pool = pool
         self.members = members
         self.thresholds = thresholds
         self.config = config or OptimizerConfig()
+        self._objective = objective
 
         # Current network state (entity names)
         self.network = initial_network.copy()
-        self.network_entities = set(self.network["entity"].str.lower().unique())
-        self.outside_entities = set(pool["entity"].str.lower().unique()) - self.network_entities
+        self.network_entities = set(self.network["entity"].dropna().str.lower().unique())
+        all_entities = set(pool["entity"].dropna().str.lower().unique())
+        self.outside_entities = all_entities - self.network_entities
 
         # Pre-compute entity -> provider mapping
         self.entity_map = {}
-        for entity, group in pool.groupby("entity"):
+        for entity, group in pool.dropna(subset=["entity"]).groupby("entity"):
             self.entity_map[entity.lower()] = group
 
         # Scoring cache
@@ -63,12 +67,14 @@ class NetworkOptimizer:
         entities = sorted(self.network_entities)
         if not entities:
             return self.pool.iloc[:0].copy()
-        return self.pool[self.pool["entity"].str.lower().isin(entities)].reset_index(drop=True)
+        return self.pool[self.pool["entity"].dropna().str.lower().isin(entities)].reset_index(drop=True)
 
     def _score(self) -> float:
         """Score current network, with caching."""
         network_df = self._get_network_df()
-        return score_network(self.pool, self.members, self.thresholds, network_df)
+        if self._objective is not None:
+            return self._objective(network_df)
+        return adequacy_score(self.members, self.thresholds, network_df)
 
     def _add_entity(self, entity: str) -> None:
         """Add an entity to the network."""
