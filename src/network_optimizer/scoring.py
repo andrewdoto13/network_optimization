@@ -16,6 +16,44 @@ def miles_to_radians(miles: float, earth_radius: float = 3958.8) -> float:
     return miles / earth_radius
 
 
+def normalize_to_100(value: float, min_val: float, max_val: float) -> float:
+    """Scale a value from [min_val, max_val] to [0, 100]."""
+    if max_val == min_val:
+        return 50.0
+    return (value - min_val) / (max_val - min_val) * 100.0
+
+
+def weighted_objective(
+    members: pd.DataFrame,
+    thresholds: dict,
+    network: pd.DataFrame,
+    weights: dict[str, float],
+    pool_stats: dict[str, dict[str, float]],
+) -> float:
+    """Compute weighted score: adequacy + column metrics.
+
+    weights: dict like {"efficiency": 0.3, "effectiveness": 0.2}
+    adequacy weight = 1.0 - sum(weights.values())
+    Column metrics normalized to 0-100 using pool min/max from pool_stats.
+    """
+    if not weights:
+        return adequacy_score(members, thresholds, network)
+
+    if network.empty:
+        return 0.0
+
+    adequacy_w = 1.0 - sum(weights.values())
+    score = adequacy_w * adequacy_score(members, thresholds, network)
+
+    for col, w in weights.items():
+        if col in network.columns:
+            col_mean = network[col].mean()
+            norm = normalize_to_100(col_mean, pool_stats[col]["min"], pool_stats[col]["max"])
+            score += w * norm
+
+    return score
+
+
 def compute_coverage(
     members: pd.DataFrame,
     thresholds: dict,

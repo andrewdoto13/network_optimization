@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from .config import OptimizerConfig
-from .data import load_all
+from .data import load_all, load_weights
 from .search import NetworkOptimizer
 
 
@@ -29,6 +29,9 @@ def main() -> None:
     parser.add_argument("--verbosity", type=int, choices=[0, 1, 2], default=1, help="Verbosity level")
     parser.add_argument("--min-entity-size", type=int, default=None, help="Min providers per entity (filters pool)")
     parser.add_argument("--n-jobs", type=int, default=1, help="Parallel workers for candidate scoring (1 = sequential)")
+    parser.add_argument("--search-mode", choices=["steepest", "first-improvement"], default="first-improvement",
+                        help="Search strategy (default: first-improvement)")
+    parser.add_argument("--weights", type=Path, default=None, help="Weights JSON path, e.g. data/weights.json")
     parser.add_argument("--quick", action="store_true", help="Quick test mode (10 rounds, no swaps)")
 
     args = parser.parse_args()
@@ -40,6 +43,7 @@ def main() -> None:
         args.enable_swaps = False
 
     print("Loading data...")
+    weights = load_weights(args.weights)
     pool, members, thresholds, initial_network = load_all(
         args.pool, args.members, args.thresholds, args.network
     )
@@ -62,6 +66,8 @@ def main() -> None:
         convergence_threshold=args.convergence,
         verbosity=args.verbosity,
         n_jobs=args.n_jobs,
+        search_mode=args.search_mode.replace("-", "_"),
+        metric_weights=weights,
     )
 
     optimizer = NetworkOptimizer(pool, members, thresholds, initial_network, config)

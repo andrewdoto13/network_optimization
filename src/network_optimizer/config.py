@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Required columns for provider pool (county is optional - BallTree handles geographic matching)
 POOL_REQUIRED = frozenset({
@@ -23,6 +23,10 @@ class OptimizerConfig:
     time_budget: float | None = None
     convergence_threshold: float = 0.0  # Stop when improvement < this % of current score
     n_jobs: int = 1  # Parallel workers for candidate scoring (1 = sequential)
+
+    # Search strategy
+    search_mode: str = "first_improvement"  # "steepest" | "first_improvement"
+    metric_weights: dict[str, float] = field(default_factory=dict)  # {"efficiency": 0.3}
 
     # Phase control
     enable_swaps: bool = False
@@ -51,6 +55,13 @@ class OptimizerConfig:
             raise ValueError("verbosity must be 0, 1, or 2")
         if self.n_jobs < 1:
             raise ValueError("n_jobs must be >= 1")
+        if self.search_mode not in ("steepest", "first_improvement"):
+            raise ValueError("search_mode must be 'steepest' or 'first_improvement'")
+        if self.metric_weights:
+            if any(v < 0 or v > 1 for v in self.metric_weights.values()):
+                raise ValueError("metric_weights values must be in [0, 1]")
+            if sum(self.metric_weights.values()) >= 1.0:
+                raise ValueError("sum of metric_weights must be < 1.0 (adequacy gets remainder)")
 
     @classmethod
     def quick(cls) -> OptimizerConfig:

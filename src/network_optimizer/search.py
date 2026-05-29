@@ -9,12 +9,12 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable
 
 import pandas as pd
 
 from .config import OptimizerConfig
-from .scoring import adequacy_score
+from .ranking import CandidateRanker
+from .scoring import compute_coverage, weighted_objective
 
 
 def _score_candidate(
@@ -24,7 +24,8 @@ def _score_candidate(
     remove_entity: str | None,
     members: pd.DataFrame,
     thresholds: dict,
-    objective: Callable[[pd.DataFrame], float] | None,
+    weights: dict[str, float],
+    pool_stats: dict[str, dict[str, float]],
 ) -> tuple[str, float]:
     """Score a candidate entity addition (or swap) in isolation.
 
@@ -37,7 +38,7 @@ def _score_candidate(
 
     network_df = pd.DataFrame() if not entities else pd.concat([entity_map[e] for e in entities], ignore_index=True)
 
-    score = objective(network_df) if objective is not None else adequacy_score(members, thresholds, network_df)
+    score = weighted_objective(members, thresholds, network_df, weights, pool_stats)
     return (candidate_entity, score)
 
 
@@ -63,13 +64,11 @@ class NetworkOptimizer:
         thresholds: dict,
         initial_network: pd.DataFrame,
         config: OptimizerConfig | None = None,
-        objective: Callable[[pd.DataFrame], float] | None = None,
     ):
         self.pool = pool
         self.members = members
         self.thresholds = thresholds
         self.config = config or OptimizerConfig()
-        self._objective = objective
 
         # Current network state (entity names)
         self.network = initial_network.copy()
@@ -83,7 +82,25 @@ class NetworkOptimizer:
         for entity, group in pool.assign(_el=entity_lower).groupby("_el", sort=False):
             self.entity_map[entity] = group.drop(columns=["_el"])
 
+        # Pre-compute pool stats for weighted metrics
+        self.pool_stats = self._build_pool_stats(config.metric_weights if config else {}, pool)
+
+        # Build candidate ranker
+        self.ranker = CandidateRanker(members, thresholds, self.entity_map, self.config, self.pool_stats)
+
         self.phases: list[dict] = []
+
+    def _build_pool_stats(
+        self,
+        weights: dict[str, float],
+        pool: pd.DataFrame,
+    ) -> dict[str, dict[str, float]]:
+        """Pre-compute min/max for weighted metric columns."""
+        stats: dict[str, dict[str, float]] = {}
+        for col in weights:
+            if col in pool.columns:
+                stats[col] = {"min": pool[col].min(), "max": pool[col].max()}
+        return stats
 
     def _get_network_df(self) -> pd.DataFrame:
         """Reconstruct network DataFrame from current entity set using entity_map."""
@@ -93,11 +110,16 @@ class NetworkOptimizer:
         return pd.concat([self.entity_map[e] for e in entities], ignore_index=True)
 
     def _score(self) -> float:
-        """Score current network, with caching."""
+        """Score current network."""
         network_df = self._get_network_df()
-        if self._objective is not None:
-            return self._objective(network_df)
-        return adequacy_score(self.members, self.thresholds, network_df)
+        return weighted_objective(
+            self.members, self.thresholds, network_df,
+            self.config.metric_weights, self.pool_stats,
+        )
+
+    def _coverage(self) -> list[dict]:
+        """Compute coverage results for current network."""
+        return compute_coverage(self.members, self.thresholds, self._get_network_df())
 
     def _add_entity(self, entity: str) -> None:
         """Add an entity to the network."""
@@ -137,11 +159,15 @@ class NetworkOptimizer:
             best_score = initial_score
             best_improvement = 0.0
 
-            candidates = sorted(self.outside_entities)
+            coverage = self._coverage()
+            candidates = self.ranker.get_relevant_candidates(self.outside_entities, coverage)
             use_parallel = (
                 self.config.n_jobs > 1
                 and len(candidates) > self.config.n_jobs
             )
+
+            if self.config.verbosity >= 2:
+                self._log(f"  Round {round_num + 1}: {len(candidates)} candidates (filtered from {len(self.outside_entities)})")
 
             if use_parallel:
                 with ThreadPoolExecutor(max_workers=self.config.n_jobs) as executor:
@@ -154,13 +180,19 @@ class NetworkOptimizer:
                             None,
                             self.members,
                             self.thresholds,
-                            self._objective,
+                            self.config.metric_weights,
+                            self.pool_stats,
                         )
                         for entity in candidates
                     ]
                     for future in futures:
                         entity, score = future.result()
                         improvement = score - initial_score
+                        if self.config.search_mode == "first_improvement" and improvement > 0:
+                            best_improvement = improvement
+                            best_score = score
+                            best_entity = entity
+                            break
                         if improvement > best_improvement:
                             best_improvement = improvement
                             best_score = score
@@ -171,6 +203,12 @@ class NetworkOptimizer:
                     score = self._score()
                     improvement = score - initial_score
                     self._remove_entity(entity)
+
+                    if self.config.search_mode == "first_improvement" and improvement > 0:
+                        best_improvement = improvement
+                        best_score = score
+                        best_entity = entity
+                        break
 
                     if improvement > best_improvement:
                         best_improvement = improvement
@@ -243,8 +281,9 @@ class NetworkOptimizer:
             best_score = initial_score
             best_improvement = 0.0
 
+            coverage = self._coverage()
+            out_entities = self.ranker.get_relevant_candidates(self.outside_entities, coverage)
             in_entities = sorted(self.network_entities)
-            out_entities = sorted(self.outside_entities)
             use_parallel = (
                 self.config.n_jobs > 1
                 and len(in_entities) * len(out_entities) > self.config.n_jobs
@@ -266,13 +305,19 @@ class NetworkOptimizer:
                             in_e,
                             self.members,
                             self.thresholds,
-                            self._objective,
+                            self.config.metric_weights,
+                            self.pool_stats,
                         )
                         for in_e, out_e in tasks
                     ]
                     for idx, future in enumerate(futures):
                         _, score = future.result()
                         improvement = score - initial_score
+                        if self.config.search_mode == "first_improvement" and improvement > 0:
+                            best_improvement = improvement
+                            best_score = score
+                            best_swap = tasks[idx]
+                            break
                         if improvement > best_improvement:
                             best_improvement = improvement
                             best_score = score
@@ -280,19 +325,25 @@ class NetworkOptimizer:
             else:
                 for in_entity in in_entities:
                     for out_entity in out_entities:
-                        # Try swap
                         self._remove_entity(in_entity)
                         self._add_entity(out_entity)
                         score = self._score()
                         improvement = score - initial_score
-                        # Undo swap
                         self._add_entity(in_entity)
                         self._remove_entity(out_entity)
+
+                        if self.config.search_mode == "first_improvement" and improvement > 0:
+                            best_improvement = improvement
+                            best_score = score
+                            best_swap = (in_entity, out_entity)
+                            break
 
                         if improvement > best_improvement:
                             best_improvement = improvement
                             best_score = score
                             best_swap = (in_entity, out_entity)
+                    if self.config.search_mode == "first_improvement" and best_swap is not None:
+                        break
 
             # Check convergence
             if self.config.convergence_threshold > 0:

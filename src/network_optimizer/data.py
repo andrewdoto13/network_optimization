@@ -221,6 +221,26 @@ def load_thresholds(path: str | Path) -> dict:
     return data
 
 
+def load_weights(path: str | Path | None) -> dict[str, float]:
+    """Load metric weights from JSON file.
+
+    Expects: {"efficiency": 0.3, "effectiveness": 0.2}
+    Returns empty dict if path is None or file doesn't exist.
+    """
+    if path is None:
+        return {}
+    path = Path(path)
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"Weights must be a JSON object, got {type(data).__name__}")
+    for key, val in data.items():
+        if not isinstance(key, str) or not isinstance(val, (int, float)):
+            raise ValueError(f"Invalid weight: {key}: {val}")
+    return {k: float(v) for k, v in data.items()}
+
+
 def load_initial_network(path: str | Path, pool: pd.DataFrame) -> pd.DataFrame:
     """Load initial network from CSV or select from pool.
 
