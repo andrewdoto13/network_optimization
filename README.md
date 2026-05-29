@@ -6,10 +6,33 @@ Given a pool of candidate contracting entities, a member population, and distanc
 
 ## Approach
 
-Two-phase local search (steepest ascent):
+Two-phase local search with configurable strategy:
 
-1. **Phase 1 (Construct):** Greedy additions — add entities one at a time, picking the biggest score improvement.
+1. **Phase 1 (Construct):** Greedy additions — add entities one at a time.
 2. **Phase 2 (Refine):** Fixed-network-size swap refinement — trade poorly-placed entities for better ones.
+
+### Search Modes
+
+- **First-improvement** (default): Accept the first candidate that improves the score. Candidates are pre-ranked by estimated contribution, so the best is evaluated first. Fast, typically evaluates far fewer candidates per round.
+- **Steepest ascent** (`--search-mode steepest`): Evaluate all candidates, pick the best. Guaranteed locally optimal per round but slower.
+
+### Candidate Prefiltering
+
+A BallTree-based prefilter eliminates entities that cannot improve coverage before scoring. It checks two conditions:
+1. **Specialty gap:** Entity has at least one specialty in a sub-100% coverage (county, specialty) pair.
+2. **Geographic reach:** Entity has at least one provider within threshold distance of an uncovered member.
+
+Typically reduces candidates by 80-90% (e.g. 13,842 → 1,658). Filter is lossless — never eliminates a candidate that could improve the score.
+
+### Weighted Objectives
+
+Combine adequacy with provider metrics via a weights JSON file:
+
+```json
+{"efficiency": 0.3, "effectiveness": 0.2}
+```
+
+Adequacy weight is implicit: `1.0 - sum(weights)`. Column metrics are normalized to 0-100 using pool min/max, then combined. Pass via `--weights path/to/weights.json`.
 
 Uses `sklearn.neighbors.BallTree` for efficient haversine distance queries — O(M log P) instead of O(M × P) cross joins. Per-specialty BallTree + per-county query approach avoids N×C tree rebuilds.
 
@@ -36,6 +59,17 @@ run-optimizer \
   --enable-swaps
 ```
 
+With weighted objectives (70% adequacy, 30% efficiency):
+
+```bash
+echo '{"efficiency": 0.3}' > weights.json
+run-optimizer \
+  --pool data/mi_market_data.csv \
+  --members data/mi_members_sample.csv \
+  --thresholds data/thresholds.json \
+  --weights weights.json
+```
+
 Quick test mode (10 rounds, no swaps):
 
 ```bash
@@ -54,6 +88,8 @@ run-optimizer \
 | `--members` | Member locations CSV (required) |
 | `--thresholds` | Distance thresholds JSON (required) |
 | `--network` | Initial network CSV (optional) |
+| `--weights` | Metric weights JSON, e.g. `{"efficiency": 0.3}` (optional) |
+| `--search-mode` | `first-improvement` (default) or `steepest` |
 | `--min-entity-size` | Minimum providers per entity to include in pool |
 | `--max-rounds` | Max rounds per phase (default: 100) |
 | `--patience` | No-improvement rounds before stopping (default: 5) |
@@ -91,6 +127,12 @@ run-optimizer \
 
 Binary coverage: member has access if **any** provider of matching specialty is within the distance threshold.
 
+**Weights** — metric weights JSON (optional):
+```json
+{"efficiency": 0.3, "effectiveness": 0.2}
+```
+Values must be in [0, 1], sum must be < 1.0. Adequacy gets the remaining weight (`1.0 - sum`). Column metrics are normalized to 0-100 using pool min/max, then combined as a weighted sum.
+
 ### Included datasets
 
 | File | Description |
@@ -115,26 +157,32 @@ Scoring: `adequacy_score` call = 0.79s for full 124K provider pool.
 
 Score = mean coverage % across all (county, specialty) thresholds.
 
-## Custom Objectives
+## Weighted Objectives
 
-The optimizer supports custom objective functions. Pass any `(network) -> float` callable:
+Combine adequacy with provider metrics via a weights JSON file. Create a weights file:
 
-```python
-from network_optimizer import NetworkOptimizer, adequacy_score, compute_coverage
-
-# Example: combine adequacy with provider effectiveness
-def my_objective(network):
-    if len(network) == 0:
-        return 0.0
-    adequacy = adequacy_score(members, thresholds, network)
-    effectiveness = network["effectiveness"].mean()
-    return adequacy * 0.7 + effectiveness * 0.3
-
-optimizer = NetworkOptimizer(pool, members, thresholds, initial_network, objective=my_objective)
-result = optimizer.optimize()
+```json
+{"efficiency": 0.3, "effectiveness": 0.2}
 ```
 
-Use `compute_coverage()` to build more complex objectives with per-county/specialty breakdowns.
+Then pass it on the CLI:
+```bash
+run-optimizer --pool pool.csv --members members.csv --thresholds thresholds.json --weights weights.json
+```
+
+The objective becomes: `0.5 * adequacy + 0.3 * efficiency + 0.2 * effectiveness` (adequacy gets the remaining weight).
+
+Column metrics are normalized to 0-100 using pool min/max. Available columns depend on your pool data — typically `effectiveness` and `efficiency` (1-5 scale).
+
+For programmatic use:
+
+```python
+from network_optimizer import NetworkOptimizer, OptimizerConfig, weighted_objective
+
+config = OptimizerConfig(metric_weights={"efficiency": 0.3})
+optimizer = NetworkOptimizer(pool, members, thresholds, initial_network, config)
+result = optimizer.optimize()
+```
 
 ## Project Structure
 
@@ -144,6 +192,7 @@ network_optimization/
 │   ├── config.py              # OptimizerConfig dataclass + validation
 │   ├── data.py                # Data loading, validation, raw-format normalization
 │   ├── scoring.py             # BallTree coverage queries + adequacy scoring
+│   ├── ranking.py             # Candidate prefiltering and ranking
 │   ├── search.py              # Two-phase local search
 │   └── main.py                # CLI entry point
 ├── data/                      # Real datasets
