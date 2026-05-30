@@ -8,9 +8,8 @@
 ## Commands
 - **Run**: `run-optimizer` or `python -m network_optimizer` (entry point: `src/network_optimizer/main.py`)
 - **CLI**: `--pool`, `--members`, `--thresholds` required; `--network` optional (starts empty). See README for full option list.
-- **Quick smoke test**: `run-optimizer --pool data/mi_market_data.csv --members data/mi_members_sample.csv --thresholds data/thresholds.json --quick`
-- **Real data test (fast)**: `run-optimizer --pool data/mi_market_data.csv --members data/mi_members_sample.csv --thresholds data/thresholds.json --min-entity-size 20 --max-rounds 2`
-- **With weights**: `echo '{"efficiency": 0.3}' > weights.json && run-optimizer --pool data/mi_market_data.csv --members data/mi_members_sample.csv --thresholds data/thresholds.json --weights weights.json --quick`
+- **Run with real data**: `run-optimizer --pool <pool_csv> --members <members_csv> --thresholds <thresholds_json>`
+- **With weights**: `echo '{"efficiency": 0.3}' > weights.json && run-optimizer --pool <pool_csv> --members <members_csv> --thresholds <thresholds_json> --weights weights.json`
 - **Lint**: `ruff check .` (selects: E F W I N UP B SIM; use `--fix --unsafe-fixes`)
 - **Type check**: `mypy src/network_optimizer` (note: `disallow_untyped_defs = false`)
 
